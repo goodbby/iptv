@@ -252,6 +252,39 @@ static void maybe_reload_channels(void) {
     pthread_mutex_unlock(&g_channels_lock);
 }
 
+/* ================= 频道可用状态（独立于 conf 热加载，按 type+id 记忆） ================= */
+#define CH_UNKNOWN 0
+#define CH_OK      1
+#define CH_BAD     2
+typedef struct { char type[8]; char id[64]; int status; time_t ts; } ch_status_t;
+static ch_status_t g_status[MAX_CHANNELS];
+static int g_nstatus = 0;
+static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int status_get(const char *type, const char *id) {
+    int st = CH_UNKNOWN;
+    pthread_mutex_lock(&g_status_lock);
+    for (int i = 0; i < g_nstatus; i++)
+        if (!strcmp(g_status[i].type, type) && !strcmp(g_status[i].id, id)) { st = g_status[i].status; break; }
+    pthread_mutex_unlock(&g_status_lock);
+    return st;
+}
+
+static void status_set(const char *type, const char *id, int st) {
+    pthread_mutex_lock(&g_status_lock);
+    int slot = -1;
+    for (int i = 0; i < g_nstatus; i++)
+        if (!strcmp(g_status[i].type, type) && !strcmp(g_status[i].id, id)) { slot = i; break; }
+    if (slot < 0 && g_nstatus < MAX_CHANNELS) slot = g_nstatus++;
+    if (slot >= 0) {
+        snprintf(g_status[slot].type, sizeof g_status[slot].type, "%s", type);
+        snprintf(g_status[slot].id, sizeof g_status[slot].id, "%s", id);
+        g_status[slot].status = st;
+        g_status[slot].ts = time(NULL);
+    }
+    pthread_mutex_unlock(&g_status_lock);
+}
+
 /* ================= HTTP 工具 ================= */
 static ssize_t send_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
@@ -472,15 +505,38 @@ static void dd_calcu_720p(const char *puData, const char *programId, char *out, 
     out[n] = 0;
 }
 
+/* 缓存写入：url 为 NULL 时记「失败负缓存」（60 秒内同 pid 直接失败，不再打上游，
+   防止播放器重试把咪咕风控打出来——原版同样有 1 分钟失败缓存） */
+static void migu_cache_store(const char *pid, const char *url) {
+    pthread_mutex_lock(&g_migu_lock);
+    int slot = 0;
+    time_t oldest = g_migu_cache[0].ts;
+    for (int i = 0; i < MIGU_CACHE_N; i++) {
+        if (!g_migu_cache[i].pid[0] || !strcmp(g_migu_cache[i].pid, pid)) { slot = i; break; }
+        if (g_migu_cache[i].ts < oldest) { oldest = g_migu_cache[i].ts; slot = i; }
+    }
+    snprintf(g_migu_cache[slot].pid, sizeof g_migu_cache[slot].pid, "%s", pid);
+    if (url) snprintf(g_migu_cache[slot].url, sizeof g_migu_cache[slot].url, "%s", url);
+    else g_migu_cache[slot].url[0] = 0;
+    g_migu_cache[slot].ts = time(NULL);
+    pthread_mutex_unlock(&g_migu_lock);
+}
+
 /* 返回 0 成功，final 为可直接播放的 m3u8 地址 */
 static int migu_resolve(const char *pid, char *final, size_t finalsz) {
     pthread_mutex_lock(&g_migu_lock);
     for (int i = 0; i < MIGU_CACHE_N; i++) {
-        if (g_migu_cache[i].pid[0] && !strcmp(g_migu_cache[i].pid, pid) &&
-            time(NULL) - g_migu_cache[i].ts < g_migu_cache_ttl) {
-            snprintf(final, finalsz, "%s", g_migu_cache[i].url);
-            pthread_mutex_unlock(&g_migu_lock);
-            return 0;
+        if (g_migu_cache[i].pid[0] && !strcmp(g_migu_cache[i].pid, pid)) {
+            time_t age = time(NULL) - g_migu_cache[i].ts;
+            if (g_migu_cache[i].url[0] && age < g_migu_cache_ttl) {
+                snprintf(final, finalsz, "%s", g_migu_cache[i].url);
+                pthread_mutex_unlock(&g_migu_lock);
+                return 0;
+            }
+            if (!g_migu_cache[i].url[0] && age < 60) { /* 失败负缓存 */
+                pthread_mutex_unlock(&g_migu_lock);
+                return -4;
+            }
         }
     }
     pthread_mutex_unlock(&g_migu_lock);
@@ -521,7 +577,7 @@ static int migu_resolve(const char *pid, char *final, size_t finalsz) {
     buf_t body;
     int code = http_fetch("migu", req, hdrs, 10, &body);
     curl_slist_free_all(hdrs);
-    if (code < 0 || !body.data) return -1;
+    if (code < 0 || !body.data) { migu_cache_store(pid, NULL); return -1; }
 
     char raw_url[3072];
     const char *urlInfo = strstr(body.data, "\"urlInfo\"");
@@ -544,6 +600,7 @@ static int migu_resolve(const char *pid, char *final, size_t finalsz) {
     if (!ok) {
         fprintf(stderr, "[iptv] migu 响应无法解析(code=%d): %.160s\n", code, body.data);
         free(body.data);
+        migu_cache_store(pid, NULL);
         return -2;
     }
     free(body.data);
@@ -876,8 +933,19 @@ static const char *ext_of(const char *url, char *ext, size_t extsz) {
     return ext;
 }
 
+/* 清单获取失败负缓存：同一上游 60 秒内直接失败，防止播放器重试把上游打死、日志刷屏 */
+static char g_man_fail_url[1024];
+static time_t g_man_fail_ts = 0;
+static pthread_mutex_t g_man_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* 抓取上游清单并改写所有 URI 为 /seg/<key>.<ext>；body 归调用方 free */
 static int proxy_manifest(const char *upstream, buf_t *out_body, const char **err) {
+    pthread_mutex_lock(&g_man_lock);
+    int neg = (g_man_fail_url[0] && !strcmp(g_man_fail_url, upstream) &&
+               time(NULL) - g_man_fail_ts < 60);
+    pthread_mutex_unlock(&g_man_lock);
+    if (neg) { *err = "上游清单获取失败"; return -1; }
+
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Referer: " HBTV_REFERER);
     hdrs = curl_slist_append(hdrs, "User-Agent: " HBTV_UA);
@@ -886,9 +954,16 @@ static int proxy_manifest(const char *upstream, buf_t *out_body, const char **er
     curl_slist_free_all(hdrs);
     if (code != 200 || !raw.data || !raw.len) {
         free(raw.data);
+        pthread_mutex_lock(&g_man_lock);
+        snprintf(g_man_fail_url, sizeof g_man_fail_url, "%s", upstream);
+        g_man_fail_ts = time(NULL);
+        pthread_mutex_unlock(&g_man_lock);
         *err = "上游清单获取失败";
         return -1;
     }
+    pthread_mutex_lock(&g_man_lock);
+    g_man_fail_url[0] = 0; /* 成功则清除负缓存 */
+    pthread_mutex_unlock(&g_man_lock);
     memset(out_body, 0, sizeof *out_body);
     out_body->cap = raw.len * 2 + 4096;
     out_body->data = malloc(out_body->cap);
@@ -1034,6 +1109,7 @@ static void send_playlist(int fd, const char *host) {
     pthread_mutex_lock(&g_channels_lock);
     for (int i = 0; i < g_nchannels; i++) {
         channel_t *c = &g_channels[i];
+        if (status_get(c->type, c->id) == CH_BAD) continue; /* 不可播的不进列表 */
         snprintf(line, sizeof line,
             "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n",
             c->name, c->name, c->logo, c->group, c->name);
@@ -1066,6 +1142,57 @@ static void send_playlist(int fd, const char *host) {
     free(b.data);
 }
 
+/* ================= 频道可用性巡检 ================= */
+/* 单频道探测：1 可播 0 不可播。direct 是用户自备直连源，不探测默认可播 */
+static int check_one(const char *type, const char *id) {
+    if (!strcmp(type, "direct")) return 1;
+    if (!strcmp(type, "migu")) { char u[4096]; return migu_resolve(id, u, sizeof u) == 0; }
+    if (!strcmp(type, "hntv")) { char u[2048]; return hntv_resolve(id, u, sizeof u) == 0; }
+    if (!strcmp(type, "hbtv")) {
+        char up[1024];
+        if (hbtv_channel_url(id, up, sizeof up) != 0) return 0;
+        buf_t body; const char *err = NULL;
+        if (proxy_manifest(up, &body, &err) == 0) { free(body.data); return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+/* 启动后首轮全量检查（不可播的从播放列表剔除）；之后每 10 分钟只复查被剔除的，
+   恢复的自动加回。pacing 温柔，避免触发上游风控 */
+static void *checker_thread(void *arg) {
+    (void)arg;
+    sleep(5);
+    int round = 0;
+    for (;;) {
+        typedef struct { char type[8]; char id[64]; } ch_ref_t;
+        static ch_ref_t refs[MAX_CHANNELS];
+        int n = 0;
+        pthread_mutex_lock(&g_channels_lock);
+        for (int i = 0; i < g_nchannels && n < MAX_CHANNELS; i++) {
+            snprintf(refs[n].type, sizeof refs[n].type, "%s", g_channels[i].type);
+            snprintf(refs[n].id, sizeof refs[n].id, "%s", g_channels[i].id);
+            n++;
+        }
+        pthread_mutex_unlock(&g_channels_lock);
+
+        int checked = 0, bad = 0;
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(refs[i].type, "direct")) continue;
+            if (round > 0 && status_get(refs[i].type, refs[i].id) != CH_BAD) continue;
+            int ok = check_one(refs[i].type, refs[i].id);
+            status_set(refs[i].type, refs[i].id, ok ? CH_OK : CH_BAD);
+            checked++;
+            if (!ok) fprintf(stderr, "[iptv] 巡检: %s/%s 不可播放，已从列表剔除\n", refs[i].type, refs[i].id);
+            usleep(!strcmp(refs[i].type, "migu") ? 1200 * 1000 : 400 * 1000);
+        }
+        if (checked) fprintf(stderr, "[iptv] 巡检完成：检查 %d 个，剔除 %d 个\n", checked, bad);
+        round++;
+        sleep(600);
+    }
+    return NULL;
+}
+
 /* ================= 请求处理 ================= */
 static void handle_request(int fd, const char *method, const char *path, const char *host) {
     int head_only = !strcasecmp(method, "HEAD");
@@ -1075,7 +1202,16 @@ static void handle_request(int fd, const char *method, const char *path, const c
     }
 
     if (!strcmp(path, "/health")) {
-        http_respond(fd, 200, "OK", "text/plain", "ok");
+        int ok = 0, bad = 0, unk = 0;
+        pthread_mutex_lock(&g_channels_lock);
+        for (int i = 0; i < g_nchannels; i++) {
+            int st = status_get(g_channels[i].type, g_channels[i].id);
+            if (st == CH_OK) ok++; else if (st == CH_BAD) bad++; else unk++;
+        }
+        pthread_mutex_unlock(&g_channels_lock);
+        char hb[160];
+        snprintf(hb, sizeof hb, "ok | 可播 %d / 剔除 %d / 未检 %d", ok, bad, unk);
+        http_respond(fd, 200, "OK", "text/plain; charset=utf-8", hb);
         return;
     }
     if (!strcmp(path, "/") || !strcmp(path, "/interface.m3u") || !strcmp(path, "/iptv.m3u")) {
@@ -1092,9 +1228,12 @@ static void handle_request(int fd, const char *method, const char *path, const c
         for (const char *c = pidbuf; *c; c++)
             if (!isdigit((unsigned char)*c)) { http_respond(fd, 400, "Bad Request", "text/plain", "bad pid"); return; }
         char final[4096];
-        if (migu_resolve(pidbuf, final, sizeof final) == 0) {
+        int rc = migu_resolve(pidbuf, final, sizeof final);
+        if (rc == 0) {
+            status_set("migu", pidbuf, CH_OK);
             http_redirect(fd, final);
         } else {
+            if (rc != -4) status_set("migu", pidbuf, CH_BAD); /* -4 是负缓存，前面已记过 */
             http_respond(fd, 502, "Bad Gateway", "text/plain; charset=utf-8", "咪咕取流失败");
         }
         return;
@@ -1108,8 +1247,10 @@ static void handle_request(int fd, const char *method, const char *path, const c
         cidbuf[pl] = 0;
         char final[2048];
         if (hntv_resolve(cidbuf, final, sizeof final) == 0) {
+            status_set("hntv", cidbuf, CH_OK);
             http_redirect(fd, final);
         } else {
+            status_set("hntv", cidbuf, CH_BAD);
             http_respond(fd, 502, "Bad Gateway", "text/plain; charset=utf-8", "河南台取流失败");
         }
         return;
@@ -1123,15 +1264,18 @@ static void handle_request(int fd, const char *method, const char *path, const c
         cidbuf[pl] = 0;
         char upstream[1024];
         if (hbtv_channel_url(cidbuf, upstream, sizeof upstream) != 0) {
+            status_set("hbtv", cidbuf, CH_BAD);
             http_respond(fd, 502, "Bad Gateway", "text/plain; charset=utf-8", "湖北台取流失败");
             return;
         }
         buf_t body;
         const char *err = NULL;
         if (proxy_manifest(upstream, &body, &err) != 0) {
+            status_set("hbtv", cidbuf, CH_BAD);
             http_respond(fd, 502, "Bad Gateway", "text/plain; charset=utf-8", err ? err : "upstream error");
             return;
         }
+        status_set("hbtv", cidbuf, CH_OK);
         char hdr[512];
         int n = snprintf(hdr, sizeof hdr,
             "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\n"
@@ -1243,6 +1387,9 @@ int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     maybe_reload_channels();
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, checker_thread, NULL) == 0) pthread_detach(th);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
