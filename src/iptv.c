@@ -303,8 +303,9 @@ static size_t buf_write(void *ptr, size_t size, size_t nmemb, void *ud) {
     return add;
 }
 
-/* 抓取整个响应体；headers 为附加请求头。成功返回 0，body 归调用方 free。 */
-static int http_fetch(const char *url, struct curl_slist *headers, long timeout, buf_t *body) {
+/* 抓取整个响应体；headers 为附加请求头。成功返回 0，body 归调用方 free。
+   tag 用于日志区分调用方；所有失败都打到 stderr（docker logs 可见）。 */
+static int http_fetch(const char *tag, const char *url, struct curl_slist *headers, long timeout, buf_t *body) {
     CURL *c = curl_easy_init();
     if (!c) return -1;
     memset(body, 0, sizeof *body);
@@ -322,8 +323,14 @@ static int http_fetch(const char *url, struct curl_slist *headers, long timeout,
     long code = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_cleanup(c);
-    if (rc != CURLE_OK) { free(body->data); body->data = NULL; return -2; }
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "[iptv] %s 请求失败: curl=%d %s (%.80s)\n",
+                tag, (int)rc, curl_easy_strerror(rc), url);
+        free(body->data); body->data = NULL; return -2;
+    }
     if (!body->data) { body->data = calloc(1, 1); body->len = 0; }
+    if (code >= 400)
+        fprintf(stderr, "[iptv] %s 上游返回 HTTP %ld: %.160s\n", tag, code, body->data);
     return (int)code;
 }
 
@@ -366,7 +373,11 @@ static int fetch_location(const char *url, long timeout, char *loc, size_t locsz
     curl_easy_setopt(c, CURLOPT_USERAGENT, "iptv-c/1.0");
     CURLcode rc = curl_easy_perform(c);
     curl_easy_cleanup(c);
-    if (rc != CURLE_OK || !h.location[0]) return 0;
+    if (rc != CURLE_OK || !h.location[0]) {
+        fprintf(stderr, "[iptv] 302跟随失败: curl=%d %s (%.80s)\n",
+                (int)rc, curl_easy_strerror(rc), url);
+        return 0;
+    }
     snprintf(loc, locsz, "%s", h.location);
     return 1;
 }
@@ -473,7 +484,7 @@ static int migu_resolve(const char *pid, char *final, size_t finalsz) {
         hdrs = curl_slist_append(hdrs, "appCode: miguvideo_default_android");
 
     buf_t body;
-    int code = http_fetch(req, hdrs, 10, &body);
+    int code = http_fetch("migu", req, hdrs, 10, &body);
     curl_slist_free_all(hdrs);
     if (code < 0 || !body.data) return -1;
 
@@ -495,8 +506,12 @@ static int migu_resolve(const char *pid, char *final, size_t finalsz) {
             }
         }
     }
+    if (!ok) {
+        fprintf(stderr, "[iptv] migu 响应无法解析(code=%d): %.160s\n", code, body.data);
+        free(body.data);
+        return -2;
+    }
     free(body.data);
-    if (!ok) return -2;
 
     /* 跟随 302 拿到最终 CDN 地址；bofang 开头的重试（与原 get302URL 一致） */
     char loc[4096];
@@ -558,7 +573,7 @@ static int hntv_fetch_list_locked(buf_t *body) {
     hdrs = curl_slist_append(hdrs, "Accept: application/json, text/plain, */*");
 
     buf_t fresh;
-    int code = http_fetch(HNTV_LIST_URL, hdrs, 10, &fresh);
+    int code = http_fetch("hntv", HNTV_LIST_URL, hdrs, 10, &fresh);
     curl_slist_free_all(hdrs);
     if (code == 200 && fresh.data && fresh.len > 2) {
         free(g_hntv_cache.data);
@@ -699,7 +714,7 @@ static int hbtv_refresh_locked(void) {
     hdrs = curl_slist_append(hdrs, "User-Agent: " HBTV_UA);
     hdrs = curl_slist_append(hdrs, "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
     buf_t body;
-    int code = http_fetch(HBTV_PAGE_URL, hdrs, 10, &body);
+    int code = http_fetch("hbtv", HBTV_PAGE_URL, hdrs, 10, &body);
     curl_slist_free_all(hdrs);
     if (code != 200 || !body.data) return -1;
     hbtv_row_t rows[HBTV_N];
@@ -831,7 +846,7 @@ static int proxy_manifest(const char *upstream, buf_t *out_body, const char **er
     hdrs = curl_slist_append(hdrs, "Referer: " HBTV_REFERER);
     hdrs = curl_slist_append(hdrs, "User-Agent: " HBTV_UA);
     buf_t raw;
-    int code = http_fetch(upstream, hdrs, 10, &raw);
+    int code = http_fetch("seg", upstream, hdrs, 10, &raw);
     curl_slist_free_all(hdrs);
     if (code != 200 || !raw.data || !raw.len) {
         free(raw.data);
@@ -1161,6 +1176,7 @@ static int selftest(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--selftest")) return selftest();
+    srand((unsigned)(time(NULL) ^ (getpid() << 16)));
 
     const char *e;
     if ((e = getenv("PORT"))) g_port = atoi(e);
