@@ -312,7 +312,7 @@ static int http_fetch(const char *tag, const char *url, struct curl_slist *heade
     if (!c) return -1;
     memset(body, 0, sizeof *body);
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
+    curl_easy_setopt(c, CURLOPT_CAINFO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, buf_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout);
@@ -365,7 +365,7 @@ static int fetch_location(const char *url, long timeout, char *loc, size_t locsz
     hdr_ctx_t h;
     h.location[0] = 0;
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
+    curl_easy_setopt(c, CURLOPT_CAINFO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, hdr_cb);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, &h);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard_cb);
@@ -958,7 +958,7 @@ static void proxy_segment(int fd, const char *url, const char *ext, int head_onl
     hdrs = curl_slist_append(hdrs, "User-Agent: " HBTV_UA);
     pipe_ctx_t pc = { fd, 0 };
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
+    curl_easy_setopt(c, CURLOPT_CAINFO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, pipe_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &pc);
