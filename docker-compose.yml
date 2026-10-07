@@ -1,0 +1,18 @@
+services:
+  iptv:
+    build: .
+    # image: <你的dockerhub用户名>/iptv-c:latest   # 用 GitHub Actions 编译好的镜像时改这行并注释 build
+    container_name: iptv-c
+    ports:
+      - "1905:1905"                # 宿主机:容器
+    environment:
+      - PORT=1905                  # 容器监听端口
+      - MIGU_RATE_TYPE=3           # 咪咕画质: 2=540p 3=720p 4=1080p(需会员)
+      - ENABLE_H265=true           # 请求 H265 流
+      - ENABLE_HDR=true            # 请求 HDR(vivid) 流
+      - MIGU_CACHE_TTL=10800       # 咪咕取流缓存（秒），默认 3 小时
+      # - EPG_URL=https://epg.112114.xyz/pp.xml   # 可选：写入 m3u 头部的电子节目单地址
+      - CHANNELS_FILE=/iptv/channels.conf
+    volumes:
+      - ./channels.conf:/iptv/channels.conf:ro   # 改频道不用重建镜像，保存即热加载
+    restart: always
