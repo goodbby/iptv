@@ -32,6 +32,10 @@ docker compose up -d --build
 
 环境变量见 `docker-compose.yml` 注释（端口、画质、H265/HDR 开关、EPG 地址、缓存时长）。
 
+镜像说明：静态编译（libcurl 全部静态链接）+ `scratch` 运行镜像，约 4MB、无任何动态库依赖；
+构建期每个架构自动跑 `--selftest` 校验 MD5/SHA-256 签名算法。注意 scratch 镜像没有 shell，
+`docker exec` 进不去，日志用 `docker logs iptv-c` 看。
+
 ## GitHub Actions 编译多架构镜像
 
 1. 把本目录推到 GitHub 仓库，push 到 main 分支即自动编译
