@@ -414,6 +414,37 @@ static int json_get_str(const char *js, const char *from, const char *key, const
     return n > 0;
 }
 
+/* JSON 文本中提取数组字段的第一个字符串元素："key":["value", ...]（从 from 位置开始找） */
+static int json_get_arr_first(const char *js, const char *from, const char *key, const char *end_before,
+                              char *out, size_t outsz) {
+    char pat[128];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = strstr(from ? from : js, pat);
+    if (!p) return 0;
+    if (end_before && p >= end_before) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '[') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return 0; /* 空数组或首元素不是字符串 */
+    p++;
+    size_t n = 0;
+    while (*p && n + 1 < outsz) {
+        if (*p == '\\' && p[1]) {
+            if (p[1] == '"' || p[1] == '/' || p[1] == '\\') { out[n++] = p[1]; p += 2; continue; }
+            out[n++] = *p++; continue;
+        }
+        if (*p == '"') break;
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+    return n > 0;
+}
+
 /* ================= 咪咕（移植 getAndroidURL720p + getddCalcuURL720p） ================= */
 typedef struct { char pid[32]; char url[4096]; time_t ts; } migu_cache_t;
 #define MIGU_CACHE_N 128
@@ -615,7 +646,8 @@ static int hntv_resolve(const char *cid, char *final, size_t finalsz) {
         const char *next = strstr(hit + 5, "\"cid\"");
         char url[2048];
         if (json_get_str(body.data, hit, "url", next, url, sizeof url) ||
-            json_get_str(body.data, hit, "video_streams", next, url, sizeof url)) {
+            json_get_arr_first(body.data, hit, "video_streams", next, url, sizeof url) ||
+            json_get_arr_first(body.data, hit, "streams", next, url, sizeof url)) {
             if (strncmp(url, "http://", 7) == 0) { /* 升级到 https（与原逻辑一致） */
                 snprintf(final, finalsz, "https://%s", url + 7);
             } else {
