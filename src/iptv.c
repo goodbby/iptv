@@ -303,6 +303,8 @@ static size_t buf_write(void *ptr, size_t size, size_t nmemb, void *ud) {
     return add;
 }
 
+#define CA_BUNDLE_PATH "/etc/ssl/certs/ca-certificates.crt"
+
 /* 抓取整个响应体；headers 为附加请求头。成功返回 0，body 归调用方 free。
    tag 用于日志区分调用方；所有失败都打到 stderr（docker logs 可见）。 */
 static int http_fetch(const char *tag, const char *url, struct curl_slist *headers, long timeout, buf_t *body) {
@@ -310,6 +312,7 @@ static int http_fetch(const char *tag, const char *url, struct curl_slist *heade
     if (!c) return -1;
     memset(body, 0, sizeof *body);
     curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, buf_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout);
@@ -362,6 +365,7 @@ static int fetch_location(const char *url, long timeout, char *loc, size_t locsz
     hdr_ctx_t h;
     h.location[0] = 0;
     curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, hdr_cb);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, &h);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard_cb);
@@ -954,6 +958,7 @@ static void proxy_segment(int fd, const char *url, const char *ext, int head_onl
     hdrs = curl_slist_append(hdrs, "User-Agent: " HBTV_UA);
     pipe_ctx_t pc = { fd, 0 };
     curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CAINO, CA_BUNDLE_PATH);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, pipe_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &pc);
@@ -1177,6 +1182,20 @@ static int selftest(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--selftest")) return selftest();
     srand((unsigned)(time(NULL) ^ (getpid() << 16)));
+
+    /* CA 证书自检：scratch 镜像里这是 HTTPS 出网的命根子，坏了直接喊出来 */
+    {
+        FILE *ca = fopen(CA_BUNDLE_PATH, "rb");
+        if (!ca) {
+            fprintf(stderr, "[iptv] 致命：CA 证书 %s 打不开: %s\n", CA_BUNDLE_PATH, strerror(errno));
+        } else {
+            fseek(ca, 0, SEEK_END);
+            long sz = ftell(ca);
+            fclose(ca);
+            fprintf(stderr, "[iptv] CA 证书 %s (%ld 字节)\n", CA_BUNDLE_PATH, sz);
+            if (sz < 10000) fprintf(stderr, "[iptv] 警告：CA 证书文件异常的小，HTTPS 可能失败\n");
+        }
+    }
 
     const char *e;
     if ((e = getenv("PORT"))) g_port = atoi(e);
