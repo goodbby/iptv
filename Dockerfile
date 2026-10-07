@@ -14,8 +14,8 @@ RUN gcc -O2 -s -Wall -static -o iptv iptv.c \
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /src/iptv /iptv
+COPY --from=build /src/iptv /usr/local/bin/iptv
 COPY channels.conf /iptv/channels.conf
 USER 1000:1000
 EXPOSE 1905
-CMD ["/iptv"]
+CMD ["iptv"]
