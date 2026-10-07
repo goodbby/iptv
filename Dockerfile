@@ -2,7 +2,8 @@
 FROM alpine:3.20 AS build
 RUN apk add --no-cache build-base pkgconf \
       curl-dev curl-static openssl-libs-static zlib-static zstd-static \
-      brotli-static nghttp2-static libidn2-static libunistring-static libpsl-static
+      brotli-static nghttp2-static libidn2-static libunistring-static libpsl-static \
+      c-ares-static
 WORKDIR /src
 COPY src/iptv.c .
 # 静态链接 libcurl 及其全部依赖，产物无任何动态库依赖；
