@@ -34,14 +34,16 @@ docker compose up -d --build
 
 ## GitHub Actions 编译多架构镜像
 
-1. 把本目录推到 GitHub 仓库
-2. 仓库 Settings → Secrets and variables → Actions 添加：
-   - `DOCKERHUB_USERNAME`：Docker Hub 用户名
-   - `DOCKERHUB_TOKEN`：Docker Hub Access Token
-3. push 到 main 分支即自动编译 `linux/amd64, linux/arm64, linux/arm/v7` 并推送
-   `<用户名>/iptv-c:latest`
+1. 把本目录推到 GitHub 仓库，push 到 main 分支即自动编译
+   `linux/amd64, linux/arm64, linux/arm/v7` 并推送到 GitHub Container Registry：
+   `ghcr.io/<你的github用户名>/iptv-c:latest`（用仓库自动的 `GITHUB_TOKEN`，无需配任何 secret）
+2. 首次推送后包默认是私有的，需改公开一次：
+   GitHub 个人主页 → Packages → `iptv-c` → Package settings → Change visibility → Public
+   （也可以在仓库首页右侧 Packages 里点进去设置）
 
-NAS / 玩客云使用编译好的镜像时，把 compose 里的 `build: .` 换成 `image: <用户名>/iptv-c:latest`。
+NAS / 玩客云使用编译好的镜像时，把 compose 里的 `build: .` 换成
+`image: ghcr.io/<你的github用户名>/iptv-c:latest`；国内拉不动可换镜像前缀
+`ghcr.nju.edu.cn/<你的github用户名>/iptv-c:latest`。
 
 ## 与原版相比砍掉的东西
 

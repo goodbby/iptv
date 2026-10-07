@@ -1,7 +1,7 @@
 services:
   iptv:
     build: .
-    # image: <你的dockerhub用户名>/iptv-c:latest   # 用 GitHub Actions 编译好的镜像时改这行并注释 build
+    # image: ghcr.io/<你的github用户名>/iptv-c:latest   # 用 Actions 编译好的镜像时改这行并注释 build；国内拉不动可试 ghcr.nju.edu.cn/<用户名>/iptv-c:latest
     container_name: iptv-c
     ports:
       - "1905:1905"                # 宿主机:容器
